@@ -39,3 +39,32 @@ Advanced usage:
 
   # Generate MuEmu-style stubs
   python mu_wire_kit.py gen --yaml ./proto.yaml --out ./stubs --style muemu
+
+New features
+------------
+PCAP writer (open in Wireshark):
+  # single port
+  python mu_wire_kit.py proxy --listen 0.0.0.0:55901 --target 127.0.0.1:55901 --log ./mu.log --pcap ./mu.pcap
+  # multi-port writes one .pcap per pair (to --logdir)
+  python mu_wire_kit.py proxy-multi --pairs 0.0.0.0:44405->127.0.0.1:44405,0.0.0.0:55901->127.0.0.1:55901 --logdir ./logs --pcap
+
+C3/C4 XOR + checksum options:
+  --xor-key 11aa22bb         # XOR-decode C3/C4 payloads with this repeating key
+  --strip-last-checksum      # drop last byte (simple checksum) before analysis/pcap
+
+Focus mode (interactive marks):
+  # while proxy runs, press ENTER in the console to insert a '# FOCUS MARK' line
+  # later, slice that window and analyze just those packets:
+  python mu_wire_kit.py extract --log ./mu.log --out ./focus.log --start 1 --end 2
+  python mu_wire_kit.py analyze --log ./focus.log --yaml ./focus.yaml --csv ./focus.csv
+
+YAML field templates → struct parsers:
+  # add to your YAML entry e.g.:
+  # - name: GC_F3_30
+  #   dir: S2C
+  #   header: C2
+  #   head: 0xF3
+  #   sub: 0x30
+  #   record_size: 16
+  #   fields: [eventId:u1, status:u1, minutes:u2, minLevel:u2, map:u1, feeItem:u2, feeCount:u2, pad:u5]
+  python mu_wire_kit.py gen-parsers --yaml ./focus.yaml --out ./parsers

@@ -63,14 +63,60 @@ class MUStreamSplitter:
                 del self.buf[0]
         return out
 
+
+# ---- PCAP writer (synthetic IPv4+UDP) --------------------------------------
+class PcapWriter:
+    def __init__(self, path, dgram_ports):
+        # dgram_ports = (src_port, dst_port) we will swap for direction
+        self.path = Path(path)
+        self.f = self.path.open("wb")
+        # Global header (pcap LE, v2.4, LINKTYPE_RAW=101)
+        self.f.write(b'\xd4\xc3\xb2\xa1' + b'\x02\x00' + b'\x04\x00' + b'\x00\x00\x00\x00' + b'\x00\x00\x00\x00' + b'\xff\xff\x00\x00' + b'\x65\x00\x00\x00')
+        self.dgram_ports = dgram_ports
+    def _ts(self):
+        import time
+        t = time.time()
+        sec = int(t)
+        usec = int((t - sec) * 1_000_000)
+        return sec, usec
+    def _ipv4_udp_packet(self, src_ip, dst_ip, src_port, dst_port, payload):
+        import ipaddress, struct
+        src = int(ipaddress.IPv4Address(src_ip))
+        dst = int(ipaddress.IPv4Address(dst_ip))
+        udp_len = 8 + len(payload)
+        # IPv4 header (20 bytes)
+        ver_ihl = 0x45; tos = 0
+        total_len = 20 + udp_len
+        identification = 0; flags_frag = 0
+        ttl = 64; proto = 17; hdr_checksum = 0
+        ipv4 = struct.pack("!BBHHHBBHII", ver_ihl, tos, total_len, identification, flags_frag, ttl, proto, hdr_checksum, src, dst)
+        udp = struct.pack("!HHHH", src_port, dst_port, udp_len, 0) + payload
+        return ipv4 + udp
+    def write_frame(self, src_ip, dst_ip, payload, direction):
+        sec, usec = self._ts()
+        sp, dp = self.dgram_ports if direction == "C→S" else (self.dgram_ports[1], self.dgram_ports[0])
+        pkt = self._ipv4_udp_packet(src_ip, dst_ip, sp, dp, payload)
+        incl_len = orig_len = len(pkt)
+        self.f.write(sec.to_bytes(4, "little"))
+        self.f.write(usec.to_bytes(4, "little"))
+        self.f.write(incl_len.to_bytes(4, "little"))
+        self.f.write(orig_len.to_bytes(4, "little"))
+        self.f.write(pkt)
+    def close(self):
+        try: self.f.close()
+        except: pass
+
 class ProxyLogger:
-    def __init__(self, listen_host, listen_port, target_host, target_port, log_path, only_dir=None, only_head=None, only_sub=None):
+    def __init__(self, listen_host, listen_port, target_host, target_port, log_path, only_dir=None, only_head=None, only_sub=None, xor_key_hex=None, strip_last_checksum=False, pcap_path=None):
         self.listen = (listen_host, listen_port)
         self.target = (target_host, target_port)
         self.log_path = Path(log_path)
         self.only_dir = only_dir
         self.only_head = set(int(x,16) for x in only_head.split(',')) if only_head else None
         self.only_sub = set(int(x,16) for x in only_sub.split(',')) if only_sub else None
+        self.xor_key = bytes.fromhex(xor_key_hex) if xor_key_hex else None
+        self.strip_last_checksum = strip_last_checksum
+        self.pcap = PcapWriter(pcap_path, (50000, 50001)) if pcap_path else None
     def run(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -97,6 +143,17 @@ class ProxyLogger:
                             dst.sendall(data)
                             frames = splitter.feed(data)
                             for header, length, head, sub, payload, raw in frames:
+                                # Optional decode for C3/C4 payload (XOR key) and strip checksum
+                                decoded_payload = payload
+                                if header in ("C3","C4") and self.xor_key:
+                                    k = self.xor_key
+                                    decoded_payload = bytes(b ^ k[i % len(k)] for i,b in enumerate(payload))
+                                if self.strip_last_checksum and len(decoded_payload) > 0:
+                                    decoded_payload = decoded_payload[:-1]
+                                # Write to PCAP as synthetic UDP
+                                if self.pcap is not None:
+                                    self.pcap.write_frame(self.listen[0], self.target[0], raw, direction)
+
                                 if self.only_dir and direction != self.only_dir:
                                     continue
                                 if self.only_head is not None and head not in self.only_head:
@@ -115,6 +172,18 @@ class ProxyLogger:
                 try:
                     src.close()
                 except: pass
+            def mark_loop():
+                try:
+                    while not stop_flag["stop"]:
+                        s = sys.stdin.readline()
+                        if not s: break
+                        with self.log_path.open("a", encoding="utf-8") as fp:
+                            fp.write(f"# FOCUS MARK {nowts()}\n")
+                            fp.flush()
+                except Exception:
+                    pass
+            tm = threading.Thread(target=mark_loop, daemon=True)
+            tm.start()
             t1 = threading.Thread(target=pump, args=(client, server, "C→S"), daemon=True)
             t2 = threading.Thread(target=pump, args=(server, client, "S→C"), daemon=True)
             t1.start(); t2.start()
@@ -123,6 +192,9 @@ class ProxyLogger:
             try:
                 server.close(); client.close()
             except: pass
+            if self.pcap is not None:
+                try: self.pcap.close()
+                except: pass
             print(f"[{nowts()}] connection closed")
 
 def parse_log_lines(lines):
@@ -256,6 +328,9 @@ def main():
     ap_proxy.add_argument("--only-dir", choices=["C→S","S→C"], help="log only one direction")
     ap_proxy.add_argument("--only-head", help="comma list of headcodes to keep (hex, e.g., F3,FB)")
     ap_proxy.add_argument("--only-sub", help="comma list of subcodes to keep (hex, e.g., 03,30)")
+    ap_proxy.add_argument("--xor-key", help="hex key for C3/C4 XOR decode (e.g., 11aa22bb)")
+    ap_proxy.add_argument("--strip-last-checksum", action="store_true", help="drop last byte of payload for simple checksumed packets")
+    ap_proxy.add_argument("--pcap", help="write a .pcap file (synthetic IPv4+UDP frames)")
 
     ap_pmulti = sub.add_parser("proxy-multi", help="run multiple proxies at once")
     ap_pmulti.add_argument("--pairs", required=True, help="comma-separated listen->target pairs, e.g. 0.0.0.0:44405->127.0.0.1:44405,0.0.0.0:55901->127.0.0.1:55901")
@@ -263,13 +338,25 @@ def main():
     ap_pmulti.add_argument("--only-dir", choices=["C→S","S→C"], help="log only one direction")
     ap_pmulti.add_argument("--only-head", help="comma list of headcodes to keep (hex)")
     ap_pmulti.add_argument("--only-sub", help="comma list of subcodes to keep (hex)")
+    ap_pmulti.add_argument("--xor-key", help="hex key for C3/C4 XOR decode")
+    ap_pmulti.add_argument("--strip-last-checksum", action="store_true")
+    ap_pmulti.add_argument("--pcap", action="store_true", help="write a .pcap per pair (in --logdir)")
 
     ap_ana = sub.add_parser("analyze", help="analyze a log file")
+    ap_x = sub.add_parser("extract", help="extract a log slice between two focus marks")
+    ap_x.add_argument("--log", required=True)
+    ap_x.add_argument("--out", required=True)
+    ap_x.add_argument("--start", type=int, default=1)
+    ap_x.add_argument("--end", type=int, default=2)
+
     ap_ana.add_argument("--log", required=True, help="log file path")
     ap_ana.add_argument("--yaml", required=True, help="proto yaml out")
     ap_ana.add_argument("--csv", required=True, help="heatmap csv out")
 
     ap_gen = sub.add_parser("gen", help="generate C++ stubs from proto yaml")
+    ap_genp = sub.add_parser("gen-parsers", help="generate C++ struct parsers from YAML field templates")
+    ap_genp.add_argument("--yaml", required=True)
+    ap_genp.add_argument("--out", required=True)
     ap_gen.add_argument("--yaml", required=True, help="proto yaml in")
     ap_gen.add_argument("--out", required=True, help="output dir for stubs")
     ap_gen.add_argument("--style", choices=["basic","muemu"], default="basic", help="stub style")
@@ -277,7 +364,7 @@ def main():
     args = ap.parse_args()
     if args.cmd == "proxy":
         lh, lp = args.listen.split(":"); th, tp = args.target.split(":")
-        ProxyLogger(lh, int(lp), th, int(tp), args.log, only_dir=args.only_dir, only_head=args.only_head, only_sub=args.only_sub).run()
+        ProxyLogger(lh, int(lp), th, int(tp), args.log, only_dir=args.only_dir, only_head=args.only_head, only_sub=args.only_sub, xor_key_hex=args.xor_key, strip_last_checksum=args.strip_last_checksum, pcap_path=args.pcap).run()
     elif args.cmd == "proxy-multi":
         from threading import Thread
         Path(args.logdir).mkdir(parents=True, exist_ok=True)
@@ -286,19 +373,87 @@ def main():
             listen, arrow, target = pair.partition("->")
             lh, lp = listen.split(":"); th, tp = target.split(":")
             logf = str(Path(args.logdir)/f"{lh.replace(":","_")}_{lp}_to_{th.replace(":","_")}_{tp}.log")
-            proxy = ProxyLogger(lh, int(lp), th, int(tp), logf, only_dir=args.only_dir, only_head=args.only_head, only_sub=args.only_sub)
+            pcapf = str(Path(args.logdir)/f"{lh.replace(':','_')}_{lp}_to_{th.replace(':','_')}_{tp}.pcap") if args.pcap else None
+            proxy = ProxyLogger(lh, int(lp), th, int(tp), logf, only_dir=args.only_dir, only_head=args.only_head, only_sub=args.only_sub, xor_key_hex=args.xor_key, strip_last_checksum=args.strip_last_checksum if hasattr(args, "strip_last_checksum") else args.strip_last_checksum, pcap_path=pcapf)
             t = Thread(target=proxy.run, daemon=True)
             t.start(); threads.append(t)
         print("proxy-multi running", len(threads), "proxies… (Ctrl+C to stop)")
         for t in threads: t.join()
+    elif args.cmd == "extract":
+        cnt = extract_log(args.log, args.out, args.start, args.end)
+        print(f"[{nowts()}] extracted {cnt} lines to {args.out}")
     elif args.cmd == "analyze":
         rows = analyze_log(args.log, yaml_out=args.yaml, csv_out=args.csv)
         print(f"[{nowts()}] analyzed {len(rows)} unique (dir, header, head, sub, length) entries")
     elif args.cmd == "gen":
         outdir = generate_stubs(args.yaml, args.out, style=args.style)
         print(f"[{nowts()}] generated stubs in {outdir}")
+    elif args.cmd == "gen-parsers":
+        outdir = generate_parsers(args.yaml, args.out)
+        print(f"[{nowts()}] generated parsers in {outdir}")
     else:
         print("Use subcommands: proxy | analyze | gen")
 
 if __name__ == "__main__":
     main()
+
+def extract_log(log_path, out_path, start_mark=1, end_mark=2):
+    lines = Path(log_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    marks = [i for i,l in enumerate(lines) if l.startswith("# FOCUS MARK ")]
+    if len(marks) < end_mark:
+        raise SystemExit(f"Not enough marks in log (have {len(marks)}, need {end_mark})")
+    s = marks[start_mark-1]+1
+    e = marks[end_mark-1]
+    out = "\n".join(lines[s:e])
+    Path(out_path).write_text(out, encoding="utf-8")
+    return e - s
+
+def generate_parsers(yaml_path, out_dir):
+    import re
+    text = Path(yaml_path).read_text(encoding="utf-8")
+    blocks = [b for b in text.split("- name: ") if b.strip()]
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    h_lines = ["#pragma once", "#include <cstdint>", "#include <vector>", "struct PacketView { const uint8_t* p; size_t n; };"]
+    cpp_lines = ['#include "parsers.h"', "static inline uint16_t LE16(const uint8_t* p){ return (uint16_t)p[0] | ((uint16_t)p[1]<<8);}",
+                 "static inline uint32_t LE32(const uint8_t* p){ return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);}"]
+    for b in blocks:
+        lines = [x.strip() for x in b.splitlines() if x.strip()]
+        name = lines[0].strip()
+        kv = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k,v = line.split(":",1); kv[k.strip()] = v.strip()
+        if "fields" in kv and "record_size" in kv:
+            inner = kv["fields"].strip().strip("[]")
+            parts = [x.strip() for x in inner.split(",") if x.strip()]
+            flds = []
+            for pz in parts:
+                if ":" in pz:
+                    nm, ty = [y.strip() for y in pz.split(":",1)]
+                    flds.append((nm, ty))
+            struct_name = name.replace("/","_").replace(" ","_")
+            h_lines.append(f"struct {struct_name} {{")
+            for nm, ty in flds:
+                cty = "uint8_t" if ty in ("u1","byte") else ("uint16_t" if ty in ("u2","le16") else ("uint32_t" if ty in ("u4","le32") else "uint8_t"))
+                h_lines.append(f"  {cty} {nm};")
+            h_lines.append("};")
+            h_lines.append(f"bool Parse_{struct_name}(PacketView v, {struct_name}& out);")
+            cpp_lines.append(f"bool Parse_{struct_name}(PacketView v, {struct_name}& o){{")
+            cpp_lines.append("  const uint8_t* p=v.p; size_t n=v.n; size_t off=0;")
+            m = re.search(r'(\d+)', kv["record_size"])
+            recsz = int(m.group(1)) if m else 0
+            if recsz>0:
+                cpp_lines.append(f"  if(n < {recsz}) return false;")
+            for nm, ty in flds:
+                if ty in ("u1","byte"):
+                    cpp_lines.append(f"  o.{nm} = p[off]; off += 1;")
+                elif ty in ("u2","le16"):
+                    cpp_lines.append(f"  o.{nm} = LE16(p+off); off += 2;")
+                elif ty in ("u4","le32"):
+                    cpp_lines.append(f"  o.{nm} = LE32(p+off); off += 4;")
+                else:
+                    cpp_lines.append(f"  /* TODO: type {ty} */")
+            cpp_lines.append("  return true; }")
+    (out/'parsers.h').write_text("\n".join(h_lines)+"\n", encoding="utf-8")
+    (out/'parsers.cpp').write_text("\n".join(cpp_lines)+"\n", encoding="utf-8")
+    return str(out)
