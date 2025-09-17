@@ -39,15 +39,38 @@ class MUStreamSplitter:
                 payload = pkt[4:]
                 out.append(("C2", total, head, sub, payload, pkt))
                 del self.buf[:total]
+            elif h == 0xC3:
+                if len(self.buf) < 3: break
+                total = self.buf[1]
+                if total <= 0 or len(self.buf) < total: break
+                head = self.buf[2] if total >= 3 else 0
+                sub = self.buf[3] if total >= 4 else None
+                pkt = bytes(self.buf[:total])
+                payload = pkt[3:]
+                out.append(("C3", total, head, sub, payload, pkt))
+                del self.buf[:total]
+            elif h == 0xC4:
+                if len(self.buf) < 4: break
+                total = (self.buf[1] << 8) | self.buf[2]
+                if total <= 0 or len(self.buf) < total: break
+                head = self.buf[3] if total >= 4 else 0
+                sub = self.buf[4] if total >= 5 else None
+                pkt = bytes(self.buf[:total])
+                payload = pkt[4:]
+                out.append(("C4", total, head, sub, payload, pkt))
+                del self.buf[:total]
             else:
                 del self.buf[0]
         return out
 
 class ProxyLogger:
-    def __init__(self, listen_host, listen_port, target_host, target_port, log_path):
+    def __init__(self, listen_host, listen_port, target_host, target_port, log_path, only_dir=None, only_head=None, only_sub=None):
         self.listen = (listen_host, listen_port)
         self.target = (target_host, target_port)
         self.log_path = Path(log_path)
+        self.only_dir = only_dir
+        self.only_head = set(int(x,16) for x in only_head.split(',')) if only_head else None
+        self.only_sub = set(int(x,16) for x in only_sub.split(',')) if only_sub else None
     def run(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -74,6 +97,12 @@ class ProxyLogger:
                             dst.sendall(data)
                             frames = splitter.feed(data)
                             for header, length, head, sub, payload, raw in frames:
+                                if self.only_dir and direction != self.only_dir:
+                                    continue
+                                if self.only_head is not None and head not in self.only_head:
+                                    continue
+                                if self.only_sub is not None and (sub is None or sub not in self.only_sub):
+                                    continue
                                 line = f"{direction} {header} head={head:02X} sub={sub:02X if sub is not None else 0} len={length:04d} hex={hexdump(raw)}"
                                 print(f"[{nowts()}] {line}")
                                 fp.write(line + "\n")
@@ -145,7 +174,7 @@ def analyze_log(log_path, yaml_out=None, csv_out=None):
         Path(yaml_out).write_text("\n".join(y), encoding="utf-8")
     return rows
 
-def generate_stubs(yaml_path, out_dir):
+def generate_stubs(yaml_path, out_dir, style='basic'):
     text = Path(yaml_path).read_text(encoding="utf-8")
     blocks = [b for b in text.split("- name: ") if b.strip()]
     entries = []
@@ -171,7 +200,30 @@ def generate_stubs(yaml_path, out_dir):
             ]
         else:
             send_decls.append(f'void Send_{e["name"]}(OBJECT_STRUCT* o /*, fields */);')
-    recv_cpp = "\n".join([
+    if style == "muemu":
+        recv_cpp = "\n".join([
+            "// Auto-generated MUEMU-style recv dispatcher skeleton",
+            "#include \"Protocol.h\"",
+            "void OnRecv_F3(OBJECT_STRUCT* lpObj, BYTE* aRecv, int aLen) {",
+            "  PSBMSG_HEAD *lpHead = (PSBMSG_HEAD*)aRecv;",
+            "  BYTE sub = lpHead->sub;",
+            "  switch (sub) {",
+            *recv_cases,
+            "    default: LogAdd(\"[OnRecv_F3] unknown sub=%02X len=%d\", sub, aLen); break;",
+            "  }",
+            "}",
+            ""
+        ])
+        send_h = "\n".join([
+            "// Auto-generated MUEMU-style send declarations",
+            "#pragma once",
+            "#include \"Protocol.h\"",
+            "struct OBJECT_STRUCT;",
+            *send_decls,
+            ""
+        ])
+    else:
+        recv_cpp = "\n".join([
         "// Auto-generated recv dispatcher skeleton",
         "void OnRecv_F3(OBJECT_STRUCT* obj, BYTE* p, int len) {",
         "  BYTE sub = p[3]; // adjust if C2",
@@ -201,6 +253,16 @@ def main():
     ap_proxy.add_argument("--listen", required=True, help="listen host:port (e.g., 0.0.0.0:55901)")
     ap_proxy.add_argument("--target", required=True, help="target host:port (e.g., 127.0.0.1:55901)")
     ap_proxy.add_argument("--log", required=True, help="log file path")
+    ap_proxy.add_argument("--only-dir", choices=["C→S","S→C"], help="log only one direction")
+    ap_proxy.add_argument("--only-head", help="comma list of headcodes to keep (hex, e.g., F3,FB)")
+    ap_proxy.add_argument("--only-sub", help="comma list of subcodes to keep (hex, e.g., 03,30)")
+
+    ap_pmulti = sub.add_parser("proxy-multi", help="run multiple proxies at once")
+    ap_pmulti.add_argument("--pairs", required=True, help="comma-separated listen->target pairs, e.g. 0.0.0.0:44405->127.0.0.1:44405,0.0.0.0:55901->127.0.0.1:55901")
+    ap_pmulti.add_argument("--logdir", required=True, help="directory for logs")
+    ap_pmulti.add_argument("--only-dir", choices=["C→S","S→C"], help="log only one direction")
+    ap_pmulti.add_argument("--only-head", help="comma list of headcodes to keep (hex)")
+    ap_pmulti.add_argument("--only-sub", help="comma list of subcodes to keep (hex)")
 
     ap_ana = sub.add_parser("analyze", help="analyze a log file")
     ap_ana.add_argument("--log", required=True, help="log file path")
@@ -210,16 +272,30 @@ def main():
     ap_gen = sub.add_parser("gen", help="generate C++ stubs from proto yaml")
     ap_gen.add_argument("--yaml", required=True, help="proto yaml in")
     ap_gen.add_argument("--out", required=True, help="output dir for stubs")
+    ap_gen.add_argument("--style", choices=["basic","muemu"], default="basic", help="stub style")
 
     args = ap.parse_args()
     if args.cmd == "proxy":
         lh, lp = args.listen.split(":"); th, tp = args.target.split(":")
-        ProxyLogger(lh, int(lp), th, int(tp), args.log).run()
+        ProxyLogger(lh, int(lp), th, int(tp), args.log, only_dir=args.only_dir, only_head=args.only_head, only_sub=args.only_sub).run()
+    elif args.cmd == "proxy-multi":
+        from threading import Thread
+        Path(args.logdir).mkdir(parents=True, exist_ok=True)
+        threads = []
+        for pair in args.pairs.split(","):
+            listen, arrow, target = pair.partition("->")
+            lh, lp = listen.split(":"); th, tp = target.split(":")
+            logf = str(Path(args.logdir)/f"{lh.replace(":","_")}_{lp}_to_{th.replace(":","_")}_{tp}.log")
+            proxy = ProxyLogger(lh, int(lp), th, int(tp), logf, only_dir=args.only_dir, only_head=args.only_head, only_sub=args.only_sub)
+            t = Thread(target=proxy.run, daemon=True)
+            t.start(); threads.append(t)
+        print("proxy-multi running", len(threads), "proxies… (Ctrl+C to stop)")
+        for t in threads: t.join()
     elif args.cmd == "analyze":
         rows = analyze_log(args.log, yaml_out=args.yaml, csv_out=args.csv)
         print(f"[{nowts()}] analyzed {len(rows)} unique (dir, header, head, sub, length) entries")
     elif args.cmd == "gen":
-        outdir = generate_stubs(args.yaml, args.out)
+        outdir = generate_stubs(args.yaml, args.out, style=args.style)
         print(f"[{nowts()}] generated stubs in {outdir}")
     else:
         print("Use subcommands: proxy | analyze | gen")
